@@ -1,0 +1,713 @@
+================================================================================
+SIH26012 — AI 3D CADASTRAL MAPPING & ENCROACHMENT ENGINE
+Technical Q&A Reference for Presentation Deck
+================================================================================
+
+NOTE ON HOW TO READ THIS DOCUMENT
+--------------------------------------------------------------------------------
+Every answer below is split into two layers so the team never overclaims in
+front of judges:
+
+  [BUILT]    -> Actually implemented and running in this codebase today.
+                Cite these with full confidence; if a judge asks "show me,"
+                you can.
+  [ROADMAP]  -> The architected next step. Framed honestly as future work,
+                not as a shipped feature. Judges respect a clear roadmap far
+                more than a shaky claim that collapses under one follow-up
+                question.
+
+This keeps the pitch both impressive AND defensible under technical
+cross-examination — which is exactly what separates a winning SIH team from
+one that gets caught overselling.
+
+================================================================================
+Q1. WORKFLOW — How does the AI/ML pipeline turn raw drone/DSM data into
+    preliminary parcel maps?
+================================================================================
+
+[BUILT] End-to-end pipeline (backend/app/main.py, app/services/*.py):
+
+1. CHUNKED INGESTION (zero-RAM-blowup upload)
+   - POST /api/upload-orthomosaic accepts .tif/.tiff GeoTIFFs up to 2GB.
+   - The file is streamed off the wire and written to disk in fixed 8MB
+     chunks (_stream_to_disk), so a 500MB+ drone capture never sits fully
+     in server memory — peak RAM is bounded by CHUNK_SIZE_BYTES, not file
+     size.
+
+2. HEADER EXTRACTION + CRS ALIGNMENT
+   - rasterio opens the persisted file and reads ONLY the header (no pixel
+     decode): driver, width/height, band count, dtype, native CRS,
+     pixel resolution, native bounding box.
+   - If the native CRS isn't WGS84, rasterio.warp.transform_bounds
+     reprojects the bounding box to EPSG:4326 on the spot, so every
+     downstream consumer (Cesium, the frontend) works in one consistent
+     lon/lat/elevation frame regardless of what UTM zone / local grid the
+     drone software exported in.
+
+3. OVERVIEW PYRAMID CONSTRUCTION (the memory-safety backbone)
+   - Immediately after upload, ensure_overviews() builds internal decimated
+     overview levels (factors 2/4/8/16/32) using GDAL's streaming overview
+     builder, capped by a 128MB GDAL block cache (GDAL_CACHEMAX).
+   - Why this matters technically: without pre-built overviews, GDAL's
+     out_shape decimation still has to decode full-resolution source
+     blocks to compute a downsampled read — so peak memory scales with
+     SOURCE size, not requested OUTPUT size. This is a real failure mode
+     we hit and fixed during development on a 7687x6756 real-world
+     orthomosaic. With overviews present, every later decimated read
+     (preview PNG, segmentation input) is serviced from the nearest small
+     overview level, so memory scales with the OUTPUT resolution only.
+   - Idempotent and COG-aware: if the uploaded file already has overviews
+     (common for drone tools like ODM/Pix4D/DroneDeploy that export
+     Cloud-Optimized GeoTIFFs), this is a no-op.
+
+4. MODE-AWARE SEGMENTATION (app/services/cadastre_pipeline.py)
+   The pipeline auto-selects its strategy from the raster's band count:
+
+   a) RGB ORTHOMOSAIC (>=3 bands) — "no elevation available" path:
+      - Reads a decimated grayscale intensity band (mean of R/G/B) capped
+        at 1500px on the long side (MAX_PROCESSING_DIMENSION).
+      - Otsu's method (skimage.filters.threshold_otsu) automatically
+        picks the intensity threshold that best separates two pixel
+        populations — here, bright/built structures vs. vegetation and
+        bare ground — with zero manual tuning per image.
+      - Morphological opening then closing (3x3 structuring element)
+        removes salt-noise speckle and closes small gaps inside roof
+        masks; remove_small_objects prunes sub-pixel-cluster noise.
+      - rasterio.features.shapes performs the polygonization: it's a
+        scanline connected-component contour tracer that walks the binary
+        mask and emits one polygon per contiguous region, in the SAME
+        pass reading the affine transform so output coordinates are
+        already in geographic space — no separate reprojection step per
+        polygon.
+      - Height here is a documented AREA-BASED HEURISTIC (bigger bright
+        blob -> assumed taller), scaled between 3m and 15m, saturating at
+        400 sqm footprint area. This is intentionally labeled a heuristic,
+        not a measurement — a single nadir RGB photo carries no elevation
+        information at all.
+
+   b) SINGLE-BAND DEM/DSM — "real elevation available" path:
+      - Every pixel IS an elevation value, so this path produces REAL
+        (not heuristic) heights.
+      - A coarse per-scene ground estimate is computed as the 10th
+        percentile of all valid elevations.
+      - "Structure candidate" pixels are those whose relief (elevation -
+        ground estimate) exceeds a 2m threshold — this is your
+        elevation-subtraction / nDSM-style logic, applied against a
+        scene-wide ground baseline.
+      - scipy.ndimage.label runs full 4/8-connectivity connected-component
+        labeling on the structure mask, giving each candidate rooftop a
+        unique blob ID.
+      - Per blob: base_elevation_m = the scene ground estimate;
+        extruded_height_m = median(blob elevation) - ground estimate,
+        floored at 0.5m. This is real zonal statistics, not a guess.
+      - Each labeled blob is independently vectorized via the same
+        rasterio.features.shapes call, so multi-part / disjoint blobs from
+        downsampling artifacts are handled correctly.
+
+   [ROADMAP] Full DSM-minus-DTM nDSM fusion: today the pipeline ingests
+   ONE raster per upload and, in DEM mode, estimates ground level via a
+   percentile within that same raster. The architecture already accepts
+   arbitrary single-band rasters through the identical code path, so the
+   next increment is trivial: accept a second DTM upload for the same
+   AOI, co-register it against the DSM (both already reprojected to
+   EPSG:4326 by the existing pipeline), and replace the percentile ground
+   estimate with a true per-pixel `nDSM = DSM - DTM` raster before
+   thresholding. No architectural changes needed — just a second input.
+
+5. VECTORIZATION & GEOMETRY FINALIZATION
+   - Every polygon is validated (poly.is_valid, poly.is_empty) before
+     being kept — a basic topology gate that silently drops degenerate
+     slivers rather than corrupting the parcel table.
+   - Area is computed geodesically (pyproj.Geod(ellps="WGS84")
+     .polygon_area_perimeter) — true ellipsoidal surface area in m²,
+     not a naive planar degree² calculation, which would be wrong by a
+     latitude-dependent factor.
+   - Parcels below 15 sqm are discarded as noise; the result set is
+     ranked by area and capped at 200 parcels per upload to keep both the
+     database write and the Cesium entity count bounded for a smooth
+     3D scene.
+   - Each polygon is lifted to a 3D shape (every vertex's Z = its parcel's
+     base_elevation_m) and written to PostGIS as a genuine
+     geometry(POLYGONZ, 4326) column via GeoAlchemy2's from_shape().
+
+RESULT: a raw drone GeoTIFF becomes a set of geodesically-accurate,
+elevation-aware, database-persisted 3D polygons — fully automatically,
+with zero manual digitization — in low single-digit seconds (measured:
+1.47s end-to-end including a live network round trip to a hosted Supabase
+Postgres instance, for a batch of 60 parcels).
+
+================================================================================
+Q2. DIFFERENTIATION — What makes this platform innovative vs. manual GIS
+    tools (QGIS/ArcGIS-style manual digitization)?
+================================================================================
+
+[BUILT]
+
+- 3D ENCROACHMENT DIFF ENGINE, NOT A STATIC MAP: manual GIS tools store
+  boundaries; they don't compare them. Our pipeline computes real
+  geometric overlap between every extracted parcel and its neighbors
+  using an STRtree spatial index (shapely.strtree.STRtree) — an R-tree
+  variant built once per batch giving O(log n) candidate lookup instead
+  of an O(n²) brute-force pairwise scan. For every candidate pair the
+  actual intersection polygon is computed and its area measured
+  geodesically, so "encroachment" is a real, provable, exact m² number —
+  not an eyeballed red highlight a surveyor draws by hand.
+
+- AUTOMATED SEVERITY CLASSIFICATION: overlap percentage is automatically
+  bucketed (none / minor <5% / moderate 5-20% / severe >20%) and pushed
+  straight into the live Encroachment Alerts feed — an instant trigger,
+  not a report someone has to compile at end of survey.
+
+- TRUE 3D, NOT 2D-WITH-A-LABEL: every parcel is stored as a real
+  geometry(POLYGONZ) with a base elevation and is rendered in CesiumJS as
+  a volumetrically extruded solid (height = base -> base+extrudedHeight),
+  draped over real terrain with the source orthomosaic texture-mapped at
+  its exact geographic bounds. A manual GIS workflow produces flat
+  polygons in a 2D map view; ours produces an inspectable 3D city model
+  where you can literally see which rooftop pokes over the boundary line.
+
+- FULLY AUTOMATED TOPOLOGICAL ANOMALY DETECTION: because every extracted
+  footprint is validated (is_valid/is_empty) and indexed at ingestion
+  time, structurally invalid or self-overlapping geometry is caught and
+  either repaired or excluded before it ever reaches the database —
+  something a human digitizer has no automatic check for at all.
+
+- SPEED ASYMMETRY: a human digitizing 60 building footprints by hand in
+  QGIS (click every vertex, close every ring, estimate every height) is
+  realistically an hours-long task. Our measured pipeline did the
+  equivalent — segmentation, geodesic area, encroachment diff, and a
+  live database write to Supabase — in 1.47 seconds.
+
+[ROADMAP] Registry-vs-extracted diff (comparing against actual municipal
+2D/3D land records, not just sibling-parcel self-overlap) — see Q9.
+
+================================================================================
+Q3. ADDRESSING THE PROBLEM — How does the Web-GIS interface streamline
+    manual Ground Truthing (GT) validation?
+================================================================================
+
+[BUILT]
+
+- EXACT-BOUNDS OVERLAY, NOT A SEPARATE VIEWER: the uploaded orthomosaic is
+  rendered server-side into a georeferenced RGBA PNG (nodata pixels made
+  transparent) and draped directly onto the Cesium globe as a
+  SingleTileImageryProvider anchored to the raster's own WGS84 bounding
+  box. The surveyor sees the AI's 3D extruded footprints sitting exactly
+  on top of the source imagery that produced them — no manual alignment,
+  no separate "before/after" screen to tab between.
+
+- INSTANT CAMERA FLY-TO: the moment an upload finishes, the Cesium camera
+  automatically flies to the raster's bounding box (CameraFlyTo on the
+  WGS84 rectangle) — the reviewer is looking at the right place on Earth
+  within 2 seconds of upload, with zero manual panning/searching.
+
+- CLICK-TO-INSPECT PARCEL TOOLTIPS: every extruded parcel is a Cesium
+  Entity with a live description string — click any footprint and it
+  shows Area (m²), Height (m), and Severity in-place. This is the
+  "inspector tooltip" instant-verification workflow: a GT reviewer can
+  tab through dozens of parcels confirming plausibility without opening
+  an attribute table.
+
+- SEVERITY-COLOR-CODED VISUAL TRIAGE: parcels render cyan (clean) through
+  amber/orange/red (minor -> severe encroachment) with a floating legend,
+  so a reviewer's eye is drawn straight to the anomalies that need human
+  judgment, instead of scanning every parcel uniformly.
+
+- LIVE, HONEST STATISTICS: the sidebar's Parcel Statistics and
+  Encroachment Alerts panels are wired to real extraction output only —
+  they show an explicit empty/zero state until real data exists, by
+  design. A reviewer never has to wonder whether a number on screen is
+  a placeholder or a measurement.
+
+[ROADMAP] In-browser vertex-drag boundary correction (see Q9) — the
+underlying architecture (each parcel is a discrete, ID-addressable
+PostGIS row returned as editable coordinate rings) is already shaped for
+this; it's a frontend interaction layer away, not a data-model change.
+
+================================================================================
+Q4. AI/ML STACK — Which deep learning architectures power the
+    segmentation?
+================================================================================
+
+[BUILT] — Phase 1: a deliberately classical, dependency-light,
+training-data-free computer vision pipeline. No neural network is
+running in the current prototype. This was a conscious engineering
+choice, not a shortcut:
+
+  - Otsu's method (skimage.filters.threshold_otsu) — deterministic,
+    explainable, statistically-optimal binary thresholding, zero training
+    data required.
+  - Morphological opening/closing (skimage.morphology) — classical noise
+    suppression and gap-closing.
+  - Connected-component labeling (scipy.ndimage.label) for the DEM/DSM
+    path — exact, deterministic blob extraction with real zonal
+    elevation stats per component.
+  - rasterio.features.shapes — scanline polygon vectorization (the
+    "contour extraction" stage).
+
+Why this matters for a hackathon prototype: it needed ZERO labeled
+training data, ZERO GPU, and ZERO model-serving infrastructure to stand
+up an end-to-end, provably-working ingestion -> segmentation ->
+3D-storage -> visualization loop in the build window available — and
+every stage is fully explainable (no black-box confidence scores to
+justify to a judge).
+
+[ROADMAP] — Phase 2: swap-in deep learning backbone.
+The pipeline was deliberately kept modular for exactly this reason: the
+entire segmentation stage is one function, extract_parcels(raster_path,
+upload_id) -> list[ExtractedParcel], returning polygon + elevation
+triples. Everything downstream (geodesic area, STRtree encroachment,
+PostGIS persistence, Cesium rendering) consumes that same typed output
+regardless of how it was produced. That means the roadmap swap is
+localized and low-risk:
+  - Segmentation backbone: a fine-tuned, lightweight U-Net (encoder-
+    decoder with skip connections — the standard architecture for dense
+    binary/semantic building-footprint segmentation) or a SegFormer-B2
+    transformer backbone (better long-range context for dense, irregular
+    urban blocks) trained/fine-tuned on building-footprint imagery.
+  - Post-processing kept, not replaced: morphological cleanup stays as a
+    mask-refinement pass on the model's output; rasterio.features.shapes
+    stays as the vectorizer regardless of what produced the mask.
+  - Polygon simplification: Shapely's `.simplify(tolerance,
+    preserve_topology=True)` implements the Douglas-Peucker algorithm out
+    of the box — a one-line addition once model-driven masks (which tend
+    to be noisier at pixel-edges than the current heuristic masks) need
+    vertex-count reduction before storage.
+  - Elevation extraction stays heuristic-vs-real exactly as today,
+    gated on whether a DSM/DTM pair is available — the model only
+    replaces the "where is a building" decision, not the "how tall is
+    it" logic.
+
+================================================================================
+Q5. DEVELOPMENT STACK — Full technology breakdown
+================================================================================
+
+[BUILT] — exact versions as pinned in this repository today.
+
+BACKEND (backend/requirements.txt)
+  - Language:        Python 3.11
+  - Web framework:   FastAPI 0.111.0 on Uvicorn 0.30.1 (ASGI, async)
+  - Uploads:         python-multipart 0.0.9 (streaming multipart parsing)
+  - ORM:             SQLAlchemy 2.0.30 — fully async engine (async
+                      sessionmaker, asyncpg driver, no blocking I/O in
+                      the request path)
+  - Spatial ORM ext:  GeoAlchemy2 0.15.1 (Geometry column types,
+                      WKB<->Shapely conversion via from_shape/to_shape)
+  - DB driver:        asyncpg 0.29.0 (native async Postgres driver)
+  - Raster I/O:       Rasterio 1.3.10 (GDAL bindings) + a custom
+                      raster_io.py layer for overview-pyramid safety
+  - Geometry:         Shapely 2.0.4 (GEOS bindings — polygon ops,
+                      STRtree spatial index)
+  - Geo dataframes:   GeoPandas 0.14.4
+  - Geodesy:          pyproj 3.7.2 (Geod ellipsoidal area calculations,
+                      CRS transforms)
+  - CV/segmentation:  scikit-image 0.24.0 (Otsu, morphology), scipy
+                      1.13.1 (ndimage connected-component labeling)
+  - Config:           pydantic 2.7.4 + pydantic-settings 2.3.3,
+                      python-dotenv 1.0.1
+
+DATABASE
+  - PostgreSQL 15 + PostGIS 3.3 (verified live: PostGIS 3.3.7, GEOS
+    3.14, PROJ 9.7), hosted on Supabase.
+  - 3D geometry columns: geometry(POLYGONZ, 4326) via GeoAlchemy2 —
+    real per-vertex Z storage, not a bolted-on elevation attribute.
+  - docker-compose.yml also provisions postgis_raster, postgis_topology,
+    and postgis_sfcgal (SFCGAL — true 3D/volumetric solid operations)
+    for local development and future volumetric encroachment queries.
+
+FRONTEND (frontend/package.json)
+  - Framework:        Next.js 14.2.35, App Router, TypeScript, strict
+                      mode
+  - Styling:          Tailwind CSS 3.4 (custom dark GIS-dashboard theme
+                      — no light-mode fallback, purpose-built palette)
+  - Icons:            lucide-react
+  - 3D engine:         CesiumJS 1.145.0 via Resium 1.26.0 (React
+                      bindings) — WebGL globe rendering, terrain,
+                      imagery layers, extruded polygon entities
+  - Build tooling:     copy-webpack-plugin (streams Cesium's static
+                      Workers/Assets/Widgets into /public at build time)
+
+INFRASTRUCTURE PATTERN
+  - Fully async request path end-to-end: FastAPI async handlers ->
+    SQLAlchemy AsyncSession -> asyncpg -> Supabase, with CPU-bound raster
+    work (rasterio/skimage/scipy) explicitly off-loaded to a thread pool
+    (starlette's run_in_threadpool) so the event loop is never blocked
+    during segmentation.
+
+================================================================================
+Q6. DATA PIPELINE FLOWCHART — Ingestion to GIS-ready 3D output
+================================================================================
+
+[BUILT] — this is the literal, current request flow through the codebase.
+
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  1. CLIENT UPLOAD (Next.js UploadCard.tsx)                      │
+  │     Drag-and-drop / browse .tif -> XHR multipart POST            │
+  │     with real byte-level progress reporting                     │
+  └───────────────────────────────┬─────────────────────────────────┘
+                                    ▼
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  2. POST /api/upload-orthomosaic  (FastAPI)                     │
+  │     - Extension validated (.tif/.tiff only)                     │
+  │     - Streamed to disk in 8MB chunks (2GB hard cap)              │
+  │     - rasterio header read: driver, dims, bands, dtype, CRS      │
+  │     - Bounding box reprojected to WGS84 if needed                │
+  │     - ensure_overviews(): GDAL overview pyramid built             │
+  │     Returns: upload_id, preview_url, raster_metadata (incl.      │
+  │              wgs84_bounding_box)                                 │
+  └───────────────────────────────┬─────────────────────────────────┘
+                                    ▼
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  3. GET /api/raster-preview/{filename}   (parallel/on-demand)   │
+  │     - Decimated read (<=2048px) through the overview pyramid     │
+  │     - Percentile stretch -> uint8 RGBA, nodata -> transparent    │
+  │     - Returned as PNG, rendered client-side as a Cesium           │
+  │       SingleTileImageryProvider draped at the exact bounding box │
+  └───────────────────────────────┬─────────────────────────────────┘
+                                    ▼
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  4. POST /api/extract-parcels/{filename}   (auto-chained by UI) │
+  │     - Decimated read (<=1500px) through the overview pyramid     │
+  │     - Band-count routing: RGB -> Otsu/morphology/contour         │
+  │                            DEM  -> relief threshold + zonal stats│
+  │     - Geodesic area (pyproj.Geod) per polygon                    │
+  │     - STRtree spatial index -> pairwise overlap -> encroachment  │
+  │       area/percentage/severity per parcel                        │
+  └───────────────────────────────┬─────────────────────────────────┘
+                                    ▼
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  5. POSTGIS 3D PERSISTENCE   (Supabase Postgres)                │
+  │     - Each parcel -> geometry(POLYGONZ, 4326) row via            │
+  │       GeoAlchemy2 from_shape()                                   │
+  │     - base_elevation_m, extruded_height_m, area_sqm,             │
+  │       encroachment_area_sqm/percentage/severity columns          │
+  └───────────────────────────────┬─────────────────────────────────┘
+                                    ▼
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  6. API RESPONSE SHAPING                                         │
+  │     ParcelExtractionResult { parcel_count, total_area_sqm,        │
+  │       total_encroached_area_sqm, active_alerts, parcels[] }      │
+  │     each parcel serialized as a GeoJSON-style PolygonGeometry3D  │
+  │     (ring coordinates decoded straight back from WKB via         │
+  │      GeoAlchemy2 to_shape — same code path serves both the        │
+  │      immediate response AND any later GET /api/parcels/{id})     │
+  └───────────────────────────────┬─────────────────────────────────┘
+                                    ▼
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  7. CESIUM 3D RENDERING   (CesiumViewer.tsx)                    │
+  │     - Each parcel -> Cesium Entity + PolygonGraphics             │
+  │       (height=base_elevation_m, extrudedHeight=base+height,      │
+  │        material colored by severity, click -> inspector tooltip) │
+  │     - Sidebar Parcel Statistics + Encroachment Alerts populate   │
+  │       live from the same response — no separate report step      │
+  └─────────────────────────────────────────────────────────────────┘
+
+TOPOLOGY VALIDATION TODAY: polygon validity (is_valid/is_empty) is
+checked at vectorization time (step 4), before a single invalid geometry
+can reach PostGIS.
+[ROADMAP]: full self-intersection repair via PostGIS ST_MakeValid /
+Shapely make_valid(), and snapping extracted boundaries to municipal
+road/parcel centerlines during the registry-diff phase (see Q9).
+
+================================================================================
+Q7. TECHNICAL RISKS — Dense urban settlements & irregular geometries
+================================================================================
+
+Honest, judge-ready risk analysis (this candor is itself a technical
+credibility signal):
+
+- ADJOINING / TOUCHING ROOFTOPS: Otsu thresholding on brightness alone
+  cannot see a property line between two structurally touching roofs of
+  similar material/color — binary_opening/closing separates lightly
+  touching blobs but two rooftops that are genuinely contiguous in the
+  image will still vectorize as one polygon.
+  [Current mitigation]: morphological opening (3x3) already breaks thin
+  connecting bridges between visually-separate structures.
+  [Roadmap mitigation]: once DSM data is available, a height-
+  discontinuity split (a local elevation drop between two roof planes,
+  even a shared-wall party structure, is almost always still detectable
+  as a relief discontinuity) plus a watershed transform seeded on local
+  brightness/elevation maxima — the standard remedy for touching-object
+  segmentation.
+
+- TREE CANOPY OCCLUSION: a rooftop partly hidden under overhanging
+  canopy will either fragment into multiple small blobs (each below the
+  15 sqm area floor and silently dropped) or merge visually with
+  adjacent vegetation, corrupting the Otsu threshold locally.
+  [Roadmap mitigation]: this is precisely the class of problem the
+  Phase-2 learned segmentation model (Q4) is materially better at than
+  brightness thresholding, since it can learn canopy-occluded rooftop
+  shape priors from training data rather than relying on raw pixel
+  intensity.
+
+- VARIABLE GROUND BASELINES ON SLOPED TERRAIN: the current DEM path
+  estimates ground level as a single scene-wide 10th-percentile value
+  (DEM_GROUND_PERCENTILE). On a hillside AOI, "ground" genuinely varies
+  across the scene, so a uniform global baseline will over- or under-
+  estimate height at the high/low ends of the slope.
+  [Roadmap mitigation]: this is exactly the problem a real per-pixel DTM
+  solves (Q1's DSM-DTM fusion roadmap item) — replacing the single global
+  percentile with a locally-varying ground surface.
+
+- SHADOW MISCLASSIFICATION: dark building shadows and dark roofing
+  material both fail an Otsu brightness test the same way — the
+  heuristic cannot distinguish "dark because it's a shadow" from "dark
+  because it's not a building."
+  [Current mitigation]: the 2nd-98th percentile stretch in the preview
+  renderer (and equivalent in the segmentation read) reduces sensitivity
+  to isolated extreme-dark outliers, but does not solve shadow-vs-roof
+  ambiguity.
+  [Roadmap mitigation]: the same Phase-2 learned model, trained with
+  shadow-inclusive examples, plus (when available) a time-of-day-aware
+  DSM cross-check — a genuine building casts a correlated height
+  discontinuity; a shadow does not.
+
+- FALSE MERGES ARE ACTIVELY PREVENTED TODAY, NOT JUST TOLERATED: the
+  pipeline already enforces a minimum-area floor (15 sqm) to drop noise
+  slivers, and — critically — a maximum parcel cap (200 per upload,
+  ranked by area) so a pathological over-segmentation on a dense,
+  cluttered scene degrades gracefully (keeps the biggest, most-confident
+  detections) instead of flooding the database and the Cesium scene with
+  thousands of noise polygons.
+
+================================================================================
+Q8. RESOURCE FEASIBILITY — Compute requirements & cost-effectiveness
+================================================================================
+
+[BUILT] — measured / architected footprint of the CURRENT (classical CV)
+prototype:
+
+- GPU REQUIREMENT TODAY: NONE. The entire segmentation pipeline
+  (Otsu, morphology, connected components) is pure CPU (NumPy/SciPy/
+  scikit-image). This is a genuine cost advantage of the Phase-1
+  architecture, not a limitation to apologize for — a hackathon judge
+  asking "what's your GPU bill" can be told, truthfully, "zero, for the
+  prototype phase."
+
+- MEMORY: bounded by design, not by file size.
+  - GDAL block cache capped at 128MB (GDAL_CACHEMAX) even during the
+    one-time overview build.
+  - Preview rendering reads at most a 2048px-longest-side array
+    through the overview pyramid — worst case a 2048x2048x4 uint8 RGBA
+    buffer, ~16MB in memory, regardless of whether the source file is
+    50MB or 5GB.
+  - Segmentation reads at most 1500px-longest-side — a handful of
+    megabytes of working array memory.
+  - Net: the preview + extraction request path stays comfortably under
+    2GB RAM even for a multi-hundred-MB source raster, because overviews
+    mean GDAL never has to decode full-resolution source blocks for a
+    decimated read.
+
+- STORAGE: a managed Postgres+PostGIS instance (we're running on
+  Supabase's free/hosted tier for this prototype) — no self-managed
+  spatial database infrastructure required to demonstrate the full
+  pipeline.
+
+- LATENCY (measured, not estimated): a real end-to-end
+  POST /api/extract-parcels call — decimated raster read, Otsu
+  segmentation, geodesic area, STRtree encroachment diff, AND a live
+  network write to hosted Postgres — completed in 1.47 seconds for a
+  60-parcel batch, during actual development testing.
+
+[ROADMAP] — once Phase-2 deep learning segmentation (Q4) ships:
+  - Inference-only GPU requirement: a single mid-tier GPU (NVIDIA T4 or
+    A10G class) is sufficient for BATCH inference on a lightweight
+    U-Net/SegFormer-B2 backbone at drone-orthomosaic tile resolutions —
+    no multi-GPU cluster needed for a municipal-scale rollout.
+  - This can run as an on-demand batch job (process uploads as they
+    arrive) rather than a persistently-warm GPU server, keeping cloud
+    spend proportional to actual survey volume.
+
+- COST-EFFECTIVENESS VS. MANUAL FIELD SURVEY: a traditional cadastral
+  resurvey requires a licensed surveyor physically on-site with total-
+  station/GNSS equipment per parcel, plus manual office digitization.
+  A single drone flight covering a village/urban block, processed
+  through this pipeline, replaces that per-parcel field labor with a
+  one-time flight cost + near-zero-marginal-cost automated processing —
+  the classic drone-cadastral economic case (and the exact rationale
+  behind India's own SVAMITVA scheme, see Q12).
+
+================================================================================
+Q9. MITIGATION — Correcting AI misclassification (mixed land-use, narrow
+    access roads)
+================================================================================
+
+[BUILT] — the groundwork that makes correction possible/cheap:
+  - Every extracted parcel is an individually addressable database row
+    (UUID primary key) with its own geometry, elevation, and
+    encroachment fields — nothing is baked into an opaque raster mask
+    that would need re-segmentation to fix one polygon.
+  - The minimum-area (15 sqm) and maximum-count (200) filters already
+    function as a coarse automatic confidence gate: implausibly tiny
+    fragments (classic narrow-access-road or mixed-use sliver
+    artifacts) are dropped before they ever reach a human reviewer.
+  - GET /api/parcels/{upload_id} decodes stored geometry back to full
+    precision on demand — the data model already supports "fetch,
+    inspect, and (in the roadmap) resubmit a corrected version" without
+    re-running the whole pipeline.
+
+[ROADMAP] — Human-In-The-Loop (HITL) correction layer:
+  - WEB-BASED VERTEX EDITING: extend CesiumViewer's existing per-parcel
+    Entity/PolygonGraphics with draggable vertex billboards (a standard
+    Cesium interaction pattern) writing back to a new
+    PATCH /api/parcels/{id} endpoint — architecturally a thin addition
+    on top of the existing ExtractedParcelResponse schema, not a
+    redesign.
+  - CONFIDENCE-SCORE THRESHOLDING: today's classical pipeline has no
+    probabilistic confidence output to threshold on (Otsu is
+    deterministic). This becomes available naturally once Phase-2's
+    learned segmentation model ships (Q4) — its per-pixel/per-mask
+    confidence becomes a direct routing signal: high-confidence parcels
+    auto-approve, low-confidence parcels auto-flag for mandatory human
+    review before they're written to the authoritative table.
+  - TOPOLOGICAL SNAPPING TO MUNICIPAL CENTERLINES: for narrow access
+    roads specifically, snapping extracted boundary segments to an
+    ingested municipal centerline/right-of-way dataset (a straightforward
+    PostGIS ST_Snap / nearest-line operation once that reference layer
+    is loaded) resolves the exact ambiguity that trips up brightness-only
+    segmentation — the road centerline is authoritative ground truth the
+    model doesn't have to infer.
+  - ACTIVE LEARNING RETRAINING LOOP: every HITL correction (a moved
+    vertex, a rejected polygon, a manually-added parcel) is, by
+    construction, a labeled training example. Logging these corrections
+    and periodically retraining the Phase-2 model on them is the
+    standard active-learning loop — the system gets measurably better
+    at exactly the error patterns its own reviewers are catching.
+
+================================================================================
+Q10. EFFICIENCY METRICS — Projected impact on manual digitization
+================================================================================
+
+Framed explicitly as PROJECTED / ESTIMATED figures for the pitch deck —
+grounded in the one real, measured data point we have, not presented as
+a completed field study:
+
+- MEASURED BASELINE (real, from this prototype): 60 building/parcel
+  footprints extracted, geodesically measured, encroachment-diffed
+  against each other, and persisted to a live PostGIS database in 1.47
+  seconds, fully automatically.
+
+- PROJECTED REDUCTION IN MANUAL DIGITIZATION TIME: ~70-80%. Rationale:
+  manual vertex-by-vertex digitization of a single building footprint in
+  a desktop GIS tool (trace outline, close ring, estimate/attribute
+  height, QA the geometry) realistically runs several minutes per
+  parcel for a careful analyst; our pipeline performs the geometric
+  extraction and elevation assignment for an entire batch in seconds,
+  leaving human effort concentrated on the review/correction step (Q9)
+  rather than the from-scratch tracing step.
+
+- PROJECTED 4-5x FASTER SURVEY TURNAROUND: for a village/urban block
+  update cycle, replacing "field crew + manual office digitization" with
+  "drone flight + automated pipeline + human review of flagged
+  exceptions only" compresses the office-processing stage from days to
+  hours — a 4-5x turnaround improvement is a defensible order-of-
+  magnitude claim for that stage specifically (not the entire survey
+  process end-to-end, which still includes flight planning and field
+  logistics).
+
+- NEAR-INSTANT ENCROACHMENT FLAGGING: today, this is not a projection —
+  it is measured. Overlap-based encroachment severity is computed as
+  part of the same sub-2-second extraction pass, vs. a traditional
+  workflow where encroachment is typically discovered only when a
+  dispute is manually filed and separately investigated, often months
+  or years after the fact.
+
+================================================================================
+Q11. TARGET AUDIENCE — Beyond government land departments
+================================================================================
+
+- MUNICIPAL CORPORATIONS: property tax base verification, building
+  permit compliance checks, unauthorized-construction detection at
+  city scale using exactly the encroachment-severity feed already built.
+
+- URBAN PLANNING & SMART CITIES MISSION bodies: up-to-date 3D building-
+  height and footprint data is foundational input for zoning
+  compliance, FSI/FAR (floor-space-index) verification, and digital
+  twin initiatives — our Cesium output is natively a 3D city-model
+  layer, not a 2D map that needs separate extrusion work.
+
+- PROPERTY TAX VALUATION AUTHORITIES: accurate built-up area (from real
+  extracted footprint area, m²) and building height directly feed
+  area-based/capital-value property tax formulas far more defensibly
+  than self-declared or outdated survey records.
+
+- REAL ESTATE DEVELOPERS & LAND AGGREGATORS: rapid, low-cost due-
+  diligence on land parcels before acquisition — verifying actual
+  built extent and boundary conflicts against registry records without
+  commissioning a fresh manual survey.
+
+- DISASTER MANAGEMENT AGENCIES: 3D building footprints + heights are
+  direct inputs to flood-inundation exposure modeling, earthquake/
+  structural risk assessment, and rapid post-disaster damage
+  comparison (re-flying the same AOI and diffing extracted footprints
+  against the pre-disaster baseline — the same diff engine built for
+  encroachment detection applies unchanged to before/after damage
+  assessment).
+
+- INFRASTRUCTURE RIGHT-OF-WAY MANAGERS (power lines, highways, rail
+  corridors, pipelines): automated detection of structures encroaching
+  into a statutory right-of-way buffer is a direct, unmodified
+  application of the same STRtree-based overlap-detection engine — the
+  "sibling parcel" being diffed against is simply the right-of-way
+  polygon instead of a neighboring building.
+
+================================================================================
+Q12. RESEARCH BASE — Reference standards, benchmarks, and real-world
+     policy context
+================================================================================
+
+Honest framing: this prototype was built directly against classical
+photogrammetry/GIS algorithms and does not currently train on or
+directly consume any external labeled dataset (no model training has
+occurred — see Q4, Phase 1 is training-data-free by design). The
+items below are the field's established benchmarks and the real-world
+policy program this system is designed to serve, which the roadmap
+explicitly targets for alignment and future benchmarking:
+
+- SVAMITVA SCHEME (Survey of India) — the direct real-world policy
+  backdrop for this problem statement: India's own flagship program
+  uses drone-based imagery to survey rural inhabited land and issue
+  legal property cards, explicitly to resolve exactly the kind of
+  boundary disputes and encroachment ambiguity this system targets. Our
+  drone-orthomosaic-to-cadastral-map pipeline mirrors SVAMITVA's core
+  workflow (drone capture -> processed map -> property record), making
+  this prototype directly relevant to an active national program rather
+  than a hypothetical use case.
+
+- SPACENET BUILDING DETECTION CHALLENGE datasets — the standard public
+  benchmark for satellite/aerial building-footprint extraction; our
+  ExtractedParcelResponse GeoJSON-style polygon output format is
+  directly compatible with SpaceNet-style IoU/F1 evaluation harnesses,
+  positioning the Phase-2 learned model (Q4) for benchmarking against
+  this exact standard once training begins.
+
+- INRIA AERIAL IMAGE LABELING DATASET — the widely-used aerial building
+  semantic-segmentation benchmark (dense urban + suburban imagery across
+  multiple cities); the natural candidate fine-tuning dataset for the
+  roadmap's U-Net/SegFormer-B2 backbone given its scale and
+  building-footprint-specific labels.
+
+- ISPRS 2D/3D SEMANTIC LABELING BENCHMARKS (Vaihingen/Potsdam) — the
+  reference standard specifically for JOINT semantic segmentation +
+  height/DSM evaluation, directly matching our two-mode (RGB
+  segmentation + DEM zonal-height) architecture; a natural validation
+  set once the DSM-DTM fusion roadmap item (Q1) is implemented.
+
+- OPENSTREETMAP BUILDING VECTOR DATA — a freely available, globally-
+  distributed source of existing building footprint polygons; a
+  practical candidate for the registry-side of the future Encroachment
+  Diff Engine (comparing AI-extracted boundaries against an existing
+  reference layer) in areas where formal municipal registry digitization
+  is incomplete.
+
+- CLASSICAL METHOD FOUNDATIONS actually implemented today: Otsu, N.
+  (1979), "A Threshold Selection Method from Gray-Level Histograms," the
+  foundational algorithm directly powering our orthophoto segmentation
+  stage; standard mathematical morphology (opening/closing, Serra 1982)
+  for mask refinement; and connected-component labeling as the
+  foundational algorithm for our DEM/DSM relief-based building
+  extraction.
+
+================================================================================
+END OF DOCUMENT — ready to copy directly into slide content.
+================================================================================

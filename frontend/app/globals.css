@@ -1,0 +1,413 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --background: #0a0e17;
+  --foreground: #e5e9f0;
+}
+
+html {
+  color-scheme: dark;
+}
+
+body {
+  color: var(--foreground);
+  background: var(--background);
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background-color: #2a3550;
+  border-radius: 9999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background-color: #384467;
+}
+
+
+/* ========================================================= */
+/* CESIUM                                                    */
+/* ========================================================= */
+
+.cesium-viewer-bottom {
+  display: none !important;
+}
+
+
+/* ========================================================= */
+/*                  CINEMATIC INTRO                          */
+/* ========================================================= */
+
+
+/* ========================================================= */
+/* BACKGROUND GRID                                           */
+/* ========================================================= */
+
+.intro-grid {
+  background-image:
+    linear-gradient(
+      rgba(255, 255, 255, 0.15) 1px,
+      transparent 1px
+    ),
+    linear-gradient(
+      90deg,
+      rgba(255, 255, 255, 0.15) 1px,
+      transparent 1px
+    );
+
+  background-size: 55px 55px;
+
+  transform:
+    perspective(600px)
+    rotateX(55deg)
+    scale(1.6);
+
+  transform-origin: center bottom;
+
+  animation:
+    introGridMove 4s linear infinite;
+}
+
+@keyframes introGridMove {
+
+  from {
+    background-position: 0 0;
+  }
+
+  to {
+    background-position: 0 55px;
+  }
+
+}
+
+
+/* ========================================================= */
+/* AI 3D LOGO                                                */
+/* ========================================================= */
+
+.intro-logo {
+  font-size: 72px;
+
+  font-weight: 800;
+
+  letter-spacing: 0.08em;
+
+  color: white;
+
+  opacity: 0;
+
+  transform: scale(0.35);
+
+  filter: blur(12px);
+
+  animation:
+    introLogoEnter 0.65s
+    cubic-bezier(0.16, 1, 0.3, 1)
+    forwards;
+}
+
+@keyframes introLogoEnter {
+
+  0% {
+    opacity: 0;
+
+    transform: scale(0.35);
+
+    filter: blur(12px);
+  }
+
+  60% {
+    opacity: 1;
+
+    filter: blur(0);
+  }
+
+  100% {
+    opacity: 1;
+
+    transform: scale(1);
+
+    filter: blur(0);
+  }
+
+}
+
+
+/* ========================================================= */
+/* LOGO EXPANSION                                            */
+/* ========================================================= */
+
+.intro-logo-expand {
+  transform: scale(1.15);
+
+  letter-spacing: 0.16em;
+
+  transition:
+    transform 0.8s ease,
+    letter-spacing 0.8s ease;
+}
+
+
+/* ========================================================= */
+/* PRODUCT TITLE                                             */
+/* ========================================================= */
+
+.intro-title-hidden {
+  opacity: 0;
+
+  transform: translateY(18px);
+
+  filter: blur(8px);
+}
+
+.intro-title-visible {
+  opacity: 1;
+
+  transform: translateY(0);
+
+  filter: blur(0);
+
+  transition:
+    opacity 0.65s ease,
+    transform 0.65s ease,
+    filter 0.65s ease;
+}
+
+
+/* ========================================================= */
+/* TAGLINE                                                   */
+/* ========================================================= */
+
+.intro-tag-hidden {
+  opacity: 0;
+
+  transform: translateY(10px);
+}
+
+.intro-tag-visible {
+  opacity: 1;
+
+  transform: translateY(0);
+
+  transition:
+    opacity 0.8s ease,
+    transform 0.8s ease;
+}
+
+
+/* ========================================================= */
+/*                 LOADING BAR                               */
+/* ========================================================= */
+
+.intro-loading-gradient {
+  width: 0%;
+
+  background: linear-gradient(
+    90deg,
+    #22d3ee,
+    #3b82f6,
+    #6366f1,
+    #8b5cf6,
+    #22d3ee
+  );
+
+  background-size: 300% 100%;
+
+  box-shadow:
+    0 0 8px rgba(34, 211, 238, 0.8),
+    0 0 18px rgba(59, 130, 246, 0.6),
+    0 0 30px rgba(139, 92, 246, 0.4);
+
+  animation:
+    introLoadingProgress 3.5s
+    cubic-bezier(0.65, 0, 0.35, 1)
+    forwards,
+    introGradientMove 1s
+    linear infinite;
+}
+
+
+/* ========================================================= */
+/* ACTUAL PROGRESS                                           */
+/* ========================================================= */
+
+@keyframes introLoadingProgress {
+
+  0% {
+    width: 0%;
+  }
+
+  10% {
+    width: 7%;
+  }
+
+  25% {
+    width: 20%;
+  }
+
+  45% {
+    width: 43%;
+  }
+
+  65% {
+    width: 65%;
+  }
+
+  82% {
+    width: 84%;
+  }
+
+  94% {
+    width: 94%;
+  }
+
+  100% {
+    width: 100%;
+  }
+
+}
+
+
+/* ========================================================= */
+/* MOVING COLOR                                              */
+/* ========================================================= */
+
+@keyframes introGradientMove {
+
+  0% {
+    background-position: 0% 50%;
+  }
+
+  100% {
+    background-position: 300% 50%;
+  }
+
+}
+
+
+/* ========================================================= */
+/* LOADING GLOW                                              */
+/* ========================================================= */
+
+.intro-loading-glow {
+  width: 0%;
+
+  background: linear-gradient(
+    90deg,
+    transparent,
+    rgba(34, 211, 238, 0.8),
+    rgba(99, 102, 241, 0.8),
+    rgba(139, 92, 246, 0.8)
+  );
+
+  filter: blur(8px);
+
+  opacity: 0.9;
+
+  animation:
+    introLoadingProgress 3.5s
+    cubic-bezier(0.65, 0, 0.35, 1)
+    forwards;
+}
+
+
+/* ========================================================= */
+/* SCANNING LINE                                             */
+/* ========================================================= */
+
+.intro-scan {
+  animation:
+    introScanLine 0.9s
+    ease-in-out
+    forwards;
+}
+
+@keyframes introScanLine {
+
+  0% {
+    transform: scaleX(0);
+
+    opacity: 0;
+  }
+
+  30% {
+    opacity: 1;
+  }
+
+  100% {
+    transform: scaleX(1);
+
+    opacity: 0;
+  }
+
+}
+
+
+/* ========================================================= */
+/* EXIT ANIMATION                                            */
+/* ========================================================= */
+
+.intro-exit {
+  animation:
+    introExit 0.6s
+    cubic-bezier(0.7, 0, 0.3, 1)
+    forwards;
+}
+
+@keyframes introExit {
+
+  0% {
+    opacity: 1;
+
+    transform: scale(1);
+  }
+
+  100% {
+    opacity: 0;
+
+    transform: scale(1.12);
+
+    filter: blur(12px);
+  }
+
+}
+
+
+/* ========================================================= */
+/* LOGO EXIT                                                 */
+/* ========================================================= */
+
+.intro-logo-exit {
+  transform: scale(1.8);
+
+  opacity: 0;
+
+  transition:
+    transform 0.6s ease,
+    opacity 0.5s ease;
+}
+
+
+/* ========================================================= */
+/* TITLE EXIT                                                */
+/* ========================================================= */
+
+.intro-title-exit {
+  opacity: 0;
+
+  transform: translateY(-20px);
+
+  transition:
+    opacity 0.4s ease,
+    transform 0.4s ease;
+}

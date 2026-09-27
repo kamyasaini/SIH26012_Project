@@ -1,0 +1,35 @@
+version: "3.9"
+
+services:
+  postgis:
+    image: postgis/postgis:15-3.3
+    container_name: cadastre_postgis
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: cadastre_admin
+      POSTGRES_PASSWORD: cadastre_secret
+      POSTGRES_DB: cadastre_db
+      # Extensions bootstrapped on first init via POSTGIS_* image hooks
+      # plus the explicit CREATE EXTENSION statements in db/init/01-extensions.sql
+      POSTGIS_ENABLE_OUTDB_RASTERS: "1"
+      POSTGIS_GDAL_ENABLED_DRIVERS: "ENABLE_ALL"
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgis_data:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cadastre_admin -d cadastre_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    command:
+      - "postgres"
+      - "-c"
+      - "max_locks_per_transaction=256"
+      - "-c"
+      - "shared_buffers=256MB"
+
+volumes:
+  postgis_data:
+    driver: local

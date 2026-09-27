@@ -1,0 +1,8 @@
+path: C:/Users/kamya/OneDrive/Desktop - Copy/Documents/SIH26012_Project/PS2/ai/dataset
+
+train: images/train
+val: images/val
+test: images/test
+
+names:
+  0: building
