@@ -237,4 +237,4 @@ async def health_check() -> dict[str, Any]:
     return {"status": "ok", "database": "connected", **postgis_status}
 
 
-@app.post("/api/upload-orthomosaic", tags=["ingesti]()
+@app.post("/api/upload-orthomosaic", tags=["ingestion"])
