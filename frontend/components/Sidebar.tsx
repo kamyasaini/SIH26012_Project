@@ -43,7 +43,6 @@ const DEFAULT_SETTINGS: TacticalSettings = {
 
 export default function Sidebar({
   stats,
-  alerts,
   onUploadComplete,
   onParcelsExtracted,
   tacticalSettings,

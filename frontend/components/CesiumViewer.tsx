@@ -23,6 +23,7 @@ import {
   SingleTileImageryProvider,
   EllipsoidTerrainProvider,
   createWorldTerrainAsync,
+  Cartesian2,
   Cartesian3,
   Rectangle,
   Color,
@@ -440,7 +441,9 @@ function CesiumViewer({
       );
 
     handler.setInputAction(
-      (movement: any) => {
+      (movement: {
+        position: Cartesian2;
+      }) => {
         const clickX =
           movement.position.x;
 
@@ -675,14 +678,6 @@ function CesiumViewer({
           /* DENSITY                                           */
           /* ================================================= */
 
-          /*
-           * Slider:
-           *
-           * 0%  = very low extrusion
-           * 50% = normal
-           * 100% = very strong extrusion
-           */
-
           const densityValue =
             settings.density / 100;
 
@@ -690,10 +685,6 @@ function CesiumViewer({
             0.35 +
             densityValue * 1.65;
 
-          /*
-           * Area contributes to the
-           * visual density.
-           */
           const areaMultiplier =
             0.65 +
             areaScore * 0.7;
@@ -709,9 +700,6 @@ function CesiumViewer({
             settings.allocation ===
             "elastic"
           ) {
-            /*
-             * Softer variation.
-             */
             allocationMultiplier =
               0.85 +
               (
@@ -725,9 +713,6 @@ function CesiumViewer({
             settings.allocation ===
             "weighted"
           ) {
-            /*
-             * Stronger differentiation.
-             */
             allocationMultiplier =
               0.75 +
               (
@@ -747,11 +732,6 @@ function CesiumViewer({
             areaMultiplier *
             allocationMultiplier;
 
-          /*
-           * Dense mode makes the 3D
-           * cadastral structure more
-           * pronounced.
-           */
           if (
             settings.style ===
             "dense"
@@ -834,29 +814,20 @@ function CesiumViewer({
                 hierarchy={Cartesian3.fromDegreesArray(
                   flatPositions,
                 )}
-
                 height={
                   parcel.base_elevation_m
                 }
-
-                /*
-                 * ACTUAL 3D CONTROL
-                 */
                 extrudedHeight={
                   parcel.base_elevation_m +
                   calculatedHeight
                 }
-
                 material={
                   fillColor
                 }
-
                 outline={true}
-
                 outlineColor={
                   outlineColor
                 }
-
                 outlineWidth={
                   isSelected
                     ? 5

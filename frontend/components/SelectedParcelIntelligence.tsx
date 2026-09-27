@@ -28,10 +28,6 @@ export default function SelectedParcelIntelligence({
   stats,
   alerts,
 }: SelectedParcelIntelligenceProps) {
-  /*
-   * No parcel selected:
-   * All intelligence panels wait here.
-   */
   if (!parcel) {
     return (
       <div className="rounded-xl border border-white/10 bg-surface/95 p-5 text-neutral-100 shadow-2xl backdrop-blur-xl">
@@ -81,10 +77,6 @@ export default function SelectedParcelIntelligence({
     );
   }
 
-  /*
-   * A parcel is selected.
-   * Show the intelligence panel for THAT parcel.
-   */
   switch (mode) {
     case "alerts":
       return (
@@ -205,7 +197,7 @@ function AlertsPanel({
 
       <DataNote>
         Alert status is derived from the selected
-        parcel's existing cadastral extraction data.
+        parcel&apos;s existing cadastral extraction data.
       </DataNote>
     </PanelShell>
   );
@@ -497,12 +489,6 @@ function AerialPanel({
 }: {
   parcel: ExtractedParcelResponse;
 }) {
-  /*
-   * useState is correctly imported at the top.
-   *
-   * This keeps the simulated aerial scan in its
-   * completed state for the selected parcel.
-   */
   const [scanComplete] =
     useState(true);
 
