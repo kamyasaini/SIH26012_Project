@@ -64,7 +64,10 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=os.getenv("CORS_ORIGINS", "http://localhost:3000").split(","),
+    allow_origins=[
+        "http://localhost:3000",
+        "https://sih-26012-project.vercel.app",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -234,120 +237,4 @@ async def health_check() -> dict[str, Any]:
     return {"status": "ok", "database": "connected", **postgis_status}
 
 
-@app.post("/api/upload-orthomosaic", tags=["ingestion"], status_code=status.HTTP_201_CREATED)
-async def upload_orthomosaic(file: UploadFile) -> dict[str, Any]:
-    """
-    Streams a drone-captured orthomosaic or DEM GeoTIFF to disk in bounded
-    chunks (protecting system RAM for files well over 500MB), then reads
-    back only the raster header to return file metadata and its spatial
-    bounding box extent in both native and WGS84 coordinates.
-    """
-    if not file.filename:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No filename provided.")
-
-    _validate_extension(file.filename)
-
-    upload_id = uuid.uuid4()
-    stored_filename = f"{upload_id}{Path(file.filename).suffix.lower()}"
-    destination = UPLOAD_DIR / stored_filename
-
-    try:
-        bytes_written = await _stream_to_disk(file, destination)
-
-        if bytes_written == 0:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Uploaded file is empty.")
-
-        try:
-            raster_metadata = await run_in_threadpool(_extract_raster_metadata, destination)
-            # Build low-res overview levels once, up front, so every later
-            # preview/extraction read is a cheap decimated read against a
-            # small overview instead of the full-resolution source (see
-            # app.services.raster_io) -- this is what a 50MB+ drone raster
-            # needs to avoid exhausting RAM.
-            await run_in_threadpool(ensure_overviews, destination)
-        except RasterioIOError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail=f"File is not a valid GeoTIFF raster: {exc}",
-            ) from exc
-
-    except HTTPException:
-        destination.unlink(missing_ok=True)
-        raise
-    except Exception as exc:
-        destination.unlink(missing_ok=True)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Upload failed: {exc}",
-        ) from exc
-
-    return {
-        "upload_id": str(upload_id),
-        "original_filename": file.filename,
-        "stored_path": str(destination),
-        "stored_filename": stored_filename,
-        "preview_url": f"/api/raster-preview/{stored_filename}",
-        "size_bytes": bytes_written,
-        "size_mb": round(bytes_written / (1024 * 1024), 2),
-        "raster_metadata": raster_metadata,
-    }
-
-
-@app.get("/api/raster-preview/{filename}", tags=["ingestion"])
-async def raster_preview(filename: str) -> Response:
-    """
-    Renders the stored GeoTIFF at `filename` into a georeferenced RGBA PNG
-    for use as a Cesium `SingleTileImageryProvider` overlay at the raster's
-    bounding box (see UploadOrthomosaicResponse.raster_metadata.wgs84_bounding_box).
-    """
-    file_path = _resolve_uploaded_file(filename)
-    try:
-        png_bytes = await run_in_threadpool(render_raster_preview_png, file_path)
-    except RasterioIOError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"Could not render preview: {exc}",
-        ) from exc
-
-    return Response(content=png_bytes, media_type="image/png")
-
-
-@app.post("/api/extract-parcels/{filename}", tags=["extraction"], response_model=ParcelExtractionResult)
-async def extract_parcels_endpoint(filename: str) -> ParcelExtractionResult:
-    """
-    Runs the heuristic 3D parcel extraction pipeline (see
-    app.services.cadastre_pipeline) against a previously uploaded raster,
-    persists the resulting parcels to Supabase PostGIS, and returns them.
-    """
-    file_path = _resolve_uploaded_file(filename)
-    upload_id = file_path.stem
-
-    try:
-        extracted = await run_in_threadpool(extract_parcels, file_path, upload_id)
-    except RasterioIOError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"Could not process raster for extraction: {exc}",
-        ) from exc
-
-    records = await _persist_parcels(upload_id, extracted)
-    responses = [_record_to_response(r) for r in records]
-    return _summarize(upload_id, responses)
-
-
-@app.get("/api/parcels/{upload_id}", tags=["extraction"], response_model=ParcelExtractionResult)
-async def get_parcels(upload_id: str) -> ParcelExtractionResult:
-    """Returns previously extracted parcels for an upload without re-running the pipeline."""
-    async with session_scope() as session:
-        result = await session.execute(
-            select(CadastralParcel).where(CadastralParcel.upload_id == upload_id)
-        )
-        records = list(result.scalars().all())
-
-    responses = [_record_to_response(r) for r in records]
-    return _summarize(upload_id, responses)
-
-
-@app.get("/", tags=["system"])
-async def root() -> dict[str, str]:
-    return {"service": "3D Cadastral Mapping & Feature Extraction API", "status": "running"}
+@app.post("/api/upload-orthomosaic", tags=["ingesti]()
